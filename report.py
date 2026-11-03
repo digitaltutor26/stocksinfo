@@ -17,7 +17,29 @@ def build_calendar_line(calendar_events: list[str]) -> str:
     return "📅 이번 주  " + " · ".join(calendar_events)
 
 
-def build_header(signals: list[dict], watchlist_symbols: list[str], today: str) -> str:
+def format_position_summary(pos: dict | None, fund: dict | None = None) -> str:
+    pos = pos or {}
+    fund = fund or {}
+    if "error" in pos:
+        pos = {}
+    if "error" in fund:
+        fund = {}
+    parts = []
+    if pos.get("week52_pct") is not None:
+        parts.append(f"52주 밴드 {pos['week52_pct']:.1f}%")
+    if pos.get("pct_vs_ma200") is not None:
+        parts.append(f"200일선 {pos['pct_vs_ma200']:+.1f}%")
+    if pos.get("relative_strength_6m_pct") is not None:
+        parts.append(f"6M 상대강도 {pos['relative_strength_6m_pct']:+.1f}%p")
+    if fund.get("trailing_pe") is not None:
+        parts.append(f"PER {fund['trailing_pe']:.1f}배")
+    return " · ".join(parts)
+
+
+def build_header(
+    signals: list[dict], watchlist_symbols: list[str], today: str,
+    watchlist: dict | None = None, fundamentals: dict | None = None,
+) -> str:
     """Deterministic traffic-light block: numbers come straight from the rule
     engine, not the LLM, so this section can never contain an invented figure.
     """
@@ -31,12 +53,24 @@ def build_header(signals: list[dict], watchlist_symbols: list[str], today: str) 
         lines.append(f"🔴 확인 필요 ({len(grouped['red'])})")
         for s in grouped["red"]:
             lines.append(f"  {s['symbol']:<8}{s['message']}")
+            summary = format_position_summary(
+                (watchlist or {}).get(s["symbol"]),
+                (fundamentals or {}).get(s["symbol"]),
+            )
+            if summary:
+                lines.append(f"    └ {summary}")
         lines.append("")
 
     if grouped["yellow"]:
         lines.append(f"🟡 관찰 ({len(grouped['yellow'])})")
         for s in grouped["yellow"]:
             lines.append(f"  {s['symbol']:<8}{s['message']}")
+            summary = format_position_summary(
+                (watchlist or {}).get(s["symbol"]),
+                (fundamentals or {}).get(s["symbol"]),
+            )
+            if summary:
+                lines.append(f"    └ {summary}")
         lines.append("")
 
     if normal:
@@ -70,8 +104,9 @@ def build_no_signal_report(watchlist_symbols: list[str], today: str, calendar_ev
 
 
 def build_report(signals: list[dict], watchlist_symbols: list[str], today: str,
-                  calendar_events: list[str], detail_text: str = "") -> str:
-    parts = [build_header(signals, watchlist_symbols, today)]
+                  calendar_events: list[str], detail_text: str = "",
+                  watchlist: dict | None = None, fundamentals: dict | None = None) -> str:
+    parts = [build_header(signals, watchlist_symbols, today, watchlist, fundamentals)]
 
     cal_line = build_calendar_line(calendar_events)
     if cal_line:

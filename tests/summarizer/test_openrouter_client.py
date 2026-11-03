@@ -47,6 +47,7 @@ def test_interpret_signals_falls_back_on_error(monkeypatch):
     import summarizer.openrouter_client as oc
     importlib.reload(oc)
 
+    monkeypatch.setattr(oc, "MODELS", ["first:free", "second:free"])
     call_count = 0
 
     def mock_create(**kwargs):

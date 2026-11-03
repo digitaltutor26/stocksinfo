@@ -8,7 +8,7 @@ from datetime import date, datetime
 import history
 import report
 import signals as signal_engine
-from collectors import economic_cal, fundamentals, kr_market, news, us_market
+from collectors import economic_cal, fundamentals
 from collectors import watchlist_stocks
 from delivery.email_sender import send, send_error
 from store import load_recipients, load_watchlist
@@ -19,20 +19,26 @@ log = logging.getLogger(__name__)
 
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 CALENDAR_LOOKAHEAD_DAYS = 7
+POSITION_CONTEXT_KEYS = (
+    "last_close", "week52_pct", "pct_vs_ma200", "drawdown_from_high_pct",
+    "return_3m_pct", "return_6m_pct", "return_12m_pct",
+    "relative_strength_6m_pct", "volume_ratio",
+)
+FUNDAMENTAL_CONTEXT_KEYS = (
+    "trailing_pe", "forward_pe", "price_to_book", "target_mean_price",
+    "recommendation", "next_earnings_date",
+)
 
 
 def collect_all(all_symbols: list) -> dict:
     collectors = {
-        "us_market": us_market.fetch,
-        "kr_market": kr_market.fetch,
-        "news": news.fetch,
         "economic_cal": economic_cal.fetch,
     }
 
     results = {}
     errors = []
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {pool.submit(fn): name for name, fn in collectors.items()}
         if all_symbols:
             futures[pool.submit(watchlist_stocks.fetch, all_symbols)] = "watchlist"
@@ -48,10 +54,9 @@ def collect_all(all_symbols: list) -> dict:
                 errors.append(f"{name}: {e}")
                 results[name] = None
 
-    for name in ("news", "economic_cal"):
-        collector_result = results.get(name)
-        if isinstance(collector_result, dict):
-            errors.extend(collector_result.get("errors", []))
+    collector_result = results.get("economic_cal")
+    if isinstance(collector_result, dict):
+        errors.extend(collector_result.get("errors", []))
 
     results["_errors"] = errors
     results["_collected_at"] = datetime.utcnow().isoformat()
@@ -101,11 +106,25 @@ def _save_snapshots(watchlist: dict, fundamentals_data: dict, today_str: str):
         })
 
 
-def _attach_related_news(detected_signals: list, watchlist: dict) -> list:
+def _attach_related_news(
+    detected_signals: list,
+    watchlist: dict,
+    fundamentals_data: dict | None = None,
+) -> list:
     enriched = []
     for sig in detected_signals:
         pos = (watchlist or {}).get(sig["symbol"]) or {}
-        enriched.append({**sig, "related_news": (pos.get("news") or [])[:3]})
+        if "error" in pos:
+            pos = {}
+        fund = (fundamentals_data or {}).get(sig["symbol"]) or {}
+        if "error" in fund:
+            fund = {}
+        enriched.append({
+            **sig,
+            "related_news": (pos.get("news") or [])[:3],
+            "position": {k: pos.get(k) for k in POSITION_CONTEXT_KEYS if pos.get(k) is not None},
+            "fundamentals": {k: fund.get(k) for k in FUNDAMENTAL_CONTEXT_KEYS if fund.get(k) is not None},
+        })
     return enriched
 
 
@@ -123,9 +142,16 @@ def build_email(watchlist: dict, fundamentals_data: dict, econ_cal: dict) -> str
     if not detected_signals:
         return report.build_no_signal_report(watchlist_symbols, today_str, calendar_events)
 
-    enriched_signals = _attach_related_news(detected_signals, watchlist)
-    detail_text = interpret_signals(enriched_signals)
-    return report.build_report(detected_signals, watchlist_symbols, today_str, calendar_events, detail_text)
+    enriched_signals = _attach_related_news(detected_signals, watchlist, fundamentals_data)
+    try:
+        detail_text = interpret_signals(enriched_signals)
+    except Exception:
+        log.warning("AI interpretation failed; sending deterministic report", exc_info=True)
+        detail_text = "AI 해설을 일시적으로 제공하지 못했습니다. 리포트의 신호와 수치는 규칙 엔진이 생성한 결과입니다."
+    return report.build_report(
+        detected_signals, watchlist_symbols, today_str, calendar_events, detail_text,
+        watchlist=watchlist, fundamentals=fundamentals_data,
+    )
 
 
 def main():

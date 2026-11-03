@@ -105,26 +105,124 @@ def test_ticker_calendar_events_skips_errored_symbols():
     assert events == []
 
 
-def test_collect_all_merges_news_errors_into_top_level_errors():
+def test_collect_all_runs_only_active_collectors():
     import main
+    from collectors import us_market, kr_market, news
 
-    with patch("main.us_market.fetch", return_value={}), \
-         patch("main.kr_market.fetch", return_value={}), \
-         patch("main.news.fetch", return_value={"articles": [], "errors": ["feed X failed"]}), \
-         patch("main.economic_cal.fetch", return_value={}):
-        result = main.collect_all([])
+    with patch.object(us_market, "fetch") as us, \
+         patch.object(kr_market, "fetch") as kr, \
+         patch.object(news, "fetch") as general_news, \
+         patch("main.economic_cal.fetch", return_value={}) as econ, \
+         patch("main.watchlist_stocks.fetch", return_value={"NVDA": {}}) as positions, \
+         patch("main.fundamentals.fetch", return_value={}) as funds:
+        result = main.collect_all(["NVDA"])
+    assert set(result) == {"watchlist", "fundamentals", "economic_cal", "_errors", "_collected_at"}
+    assert result["watchlist"] == {"NVDA": {}}
+    assert result["_errors"] == []
+    econ.assert_called_once_with()
+    positions.assert_called_once_with(["NVDA"])
+    funds.assert_called_once_with(["NVDA"])
+    for unused in (us, kr, general_news):
+        unused.assert_not_called()
 
-    assert "feed X failed" in result["_errors"]
 
-
-def test_collect_all_records_collector_exception():
+def test_collect_all_with_empty_symbols():
     import main
-
-    with patch("main.us_market.fetch", side_effect=Exception("boom")), \
-         patch("main.kr_market.fetch", return_value={}), \
-         patch("main.news.fetch", return_value={"articles": [], "errors": []}), \
-         patch("main.economic_cal.fetch", return_value={}):
+    with patch("main.economic_cal.fetch", return_value={}) as econ, \
+         patch("main.watchlist_stocks.fetch") as positions, \
+         patch("main.fundamentals.fetch") as funds:
         result = main.collect_all([])
+    econ.assert_called_once_with()
+    positions.assert_not_called()
+    funds.assert_not_called()
+    assert set(result) == {"economic_cal", "_errors", "_collected_at"}
 
-    assert any("us_market" in e for e in result["_errors"])
-    assert result["us_market"] is None
+
+def test_collect_all_merges_economic_cal_errors_and_handles_exception():
+    import main
+    with patch("main.economic_cal.fetch", return_value={"events": [], "errors": ["FRED: 400"]}), \
+         patch("main.watchlist_stocks.fetch", side_effect=RuntimeError("boom")), \
+         patch("main.fundamentals.fetch", return_value={}):
+        result = main.collect_all(["NVDA"])
+    assert set(result["_errors"]) == {"FRED: 400", "watchlist: boom"}
+    assert result["watchlist"] is None
+
+
+def test_build_email_attaches_position_and_fundamentals_to_llm_payload():
+    import main
+    watchlist = {"NVDA": _pos(ma200_cross="golden", week52_pct=88.0,
+                              pct_vs_ma200=14.2, relative_strength_6m_pct=9.1)}
+    funds = {"NVDA": {"trailing_pe": 28.5, "target_mean_price": 150.0}}
+    with patch("main.interpret_signals", return_value="해설") as interpret:
+        body = main.build_email(watchlist, funds, {})
+    sig = interpret.call_args.args[0][0]
+    assert sig["position"]["week52_pct"] == 88.0
+    assert sig["position"]["pct_vs_ma200"] == 14.2
+    assert sig["position"]["relative_strength_6m_pct"] == 9.1
+    assert sig["fundamentals"] == funds["NVDA"]
+    assert "    └ 52주 밴드 88.0% · 200일선 +14.2% · 6M 상대강도 +9.1%p · PER 28.5배" in body
+
+
+def test_attach_related_news_filters_keys_and_preserves_inputs():
+    import main
+    sig = {"symbol": "NVDA", "severity": "yellow", "type": "x", "message": "signal"}
+    pos = {key: 0 for key in main.POSITION_CONTEXT_KEYS}
+    pos.update(news=[{"title": str(i)} for i in range(5)], extra=123, return_3m_pct=None)
+    fund = {key: 0 for key in main.FUNDAMENTAL_CONTEXT_KEYS}
+    fund.update(forward_pe=None, extra=123)
+    enriched = main._attach_related_news([sig], {"NVDA": pos}, {"NVDA": fund})[0]
+    assert enriched["related_news"] == pos["news"][:3]
+    assert enriched["position"] == {k: pos[k] for k in main.POSITION_CONTEXT_KEYS if pos[k] is not None}
+    assert enriched["fundamentals"] == {k: fund[k] for k in main.FUNDAMENTAL_CONTEXT_KEYS if fund[k] is not None}
+    assert "position" not in sig
+    assert len(pos["news"]) == 5
+
+
+@pytest.mark.parametrize("pos", [None, {}, {"error": "boom", "last_close": 100, "news": [1]}])
+def test_attach_related_news_handles_missing_or_errored_positions(pos):
+    import main
+    result = main._attach_related_news([{"symbol": "NVDA"}], {"NVDA": pos})
+    assert result == [{"symbol": "NVDA", "position": {}, "fundamentals": {}, "related_news": []}]
+
+
+def test_attach_related_news_handles_errored_fundamentals():
+    import main
+    result = main._attach_related_news(
+        [{"symbol": "NVDA"}], {"NVDA": {"last_close": 100}},
+        {"NVDA": {"error": "boom", "trailing_pe": 30}},
+    )
+    assert result[0]["position"] == {"last_close": 100}
+    assert result[0]["fundamentals"] == {}
+
+
+def test_build_email_keeps_report_when_all_llm_models_fail(caplog):
+    import main
+    watchlist = {"NVDA": _pos(ma200_cross="golden", week52_pct=88.0)}
+    with patch("main.interpret_signals", side_effect=RuntimeError("모든 모델 실패: 404")):
+        body = main.build_email(watchlist, {"NVDA": {"trailing_pe": 28.5}},
+                                {"events": [{"name": "주요 거시 일정"}]})
+    assert "200일선 상향 돌파" in body
+    assert "52주 밴드 88.0% · PER 28.5배" in body
+    assert "주요 거시 일정" in body
+    assert "AI 해설을 일시적으로 제공하지 못했습니다." in body
+    assert "투자 참고용" in body
+    assert "404" not in body
+    assert "모든 모델 실패: 404" in caplog.text
+
+
+def test_main_sends_briefing_instead_of_error_email_when_llm_unavailable():
+    import main
+    data = {"watchlist": {"NVDA": _pos(ma200_cross="golden")},
+            "fundamentals": {}, "economic_cal": {}}
+    with patch("config.validate"), \
+         patch("main.load_watchlist", return_value={"us": ["NVDA"], "kr": []}), \
+         patch("main.collect_all", return_value=data), \
+         patch("main.interpret_signals", side_effect=RuntimeError("모든 모델 실패: 404")), \
+         patch("main.load_recipients", return_value={"emails": ["receiver@test.com"]}), \
+         patch("main.send") as send, patch("main.send_error") as send_error:
+        main.main()
+    send.assert_called_once()
+    assert send.call_args.kwargs == {"to": "receiver@test.com"}
+    assert "200일선 상향 돌파" in send.call_args.args[0]
+    assert "AI 해설을 일시적으로 제공하지 못했습니다." in send.call_args.args[0]
+    send_error.assert_not_called()

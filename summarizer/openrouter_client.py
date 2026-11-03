@@ -9,14 +9,9 @@ client = OpenAI(
     api_key=OPENROUTER_API_KEY,
 )
 
-# Verified against https://openrouter.ai/api/v1/models at write time — OpenRouter's
-# free tier rotates often (the previous list's llama-3.3-70b:free had already been
-# pulled), so if summarize starts failing, re-check that list before assuming a bug.
-MODELS = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "google/gemma-4-31b-it:free",
-    "openai/gpt-oss-20b:free",
-]
+# The free router selects currently available free models, avoiding retired slugs.
+# https://openrouter.ai/docs/guides/routing/routers/free-router
+MODELS = ["openrouter/free"]
 
 BASE_MAX_TOKENS = 400
 PER_SIGNAL_TOKENS = 300
@@ -29,6 +24,7 @@ SYSTEM_PROMPT = """당신은 중장기 보유 투자자를 위한 애널리스�
 규칙:
 - 숫자(%, 배수, 가격 등)는 반드시 전달된 신호 데이터에 있는 것만 인용한다. 새로운 숫자를 계산하거나 지어내지 않는다.
 - 진입가·손절가 등 단기 매매 신호는 제시하지 않는다. 이 서비스는 중장기 보유자를 대상으로 하며, 그런 데이터 자체가 주어지지 않는다.
+- position(52주 밴드 백분위, 200일선 이격도, 고점 대비 낙폭, 수익률, 6개월 상대강도 등) 및 fundamentals(PER, PBR, 목표주가 등)의 수치를 적극 인용하여 신호의 중장기적 맥락을 설명한다. 데이터에 없는 숫자는 절대 계산하거나 지어내지 않는다.
 - related_news가 있으면 맥락으로 참고하되, 기사에 없는 사실을 지어내지 않는다.
 - 신호가 있는 종목만, 종목별로 2~3문장씩 작성한다. "종목명 — 해설" 형식.
 - 신호가 여러 개인 종목은 함께 묶어서 설명해도 된다."""
