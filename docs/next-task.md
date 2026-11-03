@@ -1,60 +1,117 @@
 # 다음 구현 과제 명세서 (`docs/next-task.md`)
 
-> **기준 저장소**: `https://github.com/digitaltutor26/stocksinfo` (커밋 `bad4d1b` 기준)  
-> **관련 문서**: 현행 시스템 전체 요구사항 명세는 [`docs/requirements.md`](./requirements.md), 개편 로드맵은 [`REDESIGN.md`](../REDESIGN.md) 참조.
+> **기준 문서**: [`docs/requirements.md`](./requirements.md) (FR-01, FR-04 미구현 구간 해소)  
+> **구현 담당자(Codex) 안내**: 본 문서는 단일 구현 기준입니다. 아래 정의된 함수 시그니처, 딕셔너리 키 이름, 문자열 포맷, 완료 조건 및 테스트 케이스를 그대로 준수하여 구현하고, 구현 완료 후 결과를 `docs/implementation-result.md`에 기록하세요.
 
 ---
 
-## 1. 현행 요구사항 명세 및 현재 상태 요약
+## 1. 선정 기능 및 배경
 
-별도의 요구사항 명세서가 존재하지 않아 현행 소스코드를 역분석한 결과(상세 내용은 [`docs/requirements.md`](./requirements.md) 참조), 시스템의 현재 구현 상태는 다음과 같습니다.
-
-### 1.1 구현 완료된 기능 (Phase 1 ~ Phase 3)
-| 구분 | 모듈 | 현재 구현 상태 |
-|---|---|---|
-| **축 A (위치 지표)** | `collectors/watchlist_stocks.py` | 2년치 일봉 기반 52주 최고/최저/백분위(`week52_pct`), 고점 대비 낙폭(`drawdown_from_high_pct`), 52주 신고가/신저가 경신 여부, 200일선 이격도 및 골든/데드크로스(`ma200_cross`), 3·6·12개월 수익률, 벤치마크 대비 6개월 상대강도(`relative_strength_6m_pct`), 20일 거래량 배수(`volume_ratio`), 종목 뉴스 수집 완료 |
-| **축 B (기억 및 변화 신호)** | `history.py`, `signals.py` | SQLite(`stocksinfo.db`) `daily_snapshot` 테이블에 일별 `(date, symbol, last_close, trailing_pe, target_mean_price, volume)` 저장 완료. 200일선 돌파, 52주 신고가/신저가, 거래량 급증(≥2.0배), 실적발표 임박(D-7), PER 밴드 이탈(±1σ, 최소 20샘플), 목표주가 주간 변화(±3%) 총 6종 규칙 판정 완료 |
-| **축 C (펀더멘털)** | `collectors/fundamentals.py` | PER(trailing/forward), PBR, 배당수익률, 배당락일, 부채비율, 잉여현금흐름, 애널리스트 목표주가(평균/상단/하단) 및 차기 실적발표일 수집 완료 |
-| **축 D (캘린더 & 리포트)** | `main.py`, `report.py`, `summarizer/openrouter_client.py` | 무신호 시 LLM 호출 생략(`신호 0건` 단문 리포트), 신호 발생 시에만 OpenRouter LLM 해설 호출, 신호등(🔴/🟡/⚪) 레이아웃 및 주간 일정 조립 완료 |
-| **관리 웹 대시보드** | `web/app.py`, `web/templates/index.html` | 미국/한국 관심종목 추가·삭제, 이메일 수신자 추가·삭제, 즉시 전송(`/run-now`), GitHub 동기화(`/push`) 구현 완료 |
-| **테스트 스위트** | `tests/` | 수집기, 신호 엔진, 히스토리 DB, 리포트, 이메일, 웹 대시보드 단위 테스트 총 58건 통과 중 |
-
-### 1.2 미구현 과제 및 이번 구현 기능 선정
-- **선정 기능**: **웹 대시보드 종목별 스냅샷 히스토리 및 최신 지표 요약 뷰 (`REDESIGN.md` Phase 4)**
-- **선정 이유**:
-  1. `REDESIGN.md`의 로드맵 중 Phase 1~3은 이미 코드에 반영되었으나, **Phase 4("웹 대시보드에 차트·히스토리 뷰")**가 아직 구현되지 않았습니다.
-  2. 현재 `stocksinfo.db`(`history.py`)에 매일 종목별 스냅샷이 저장되고 있음에도 웹 대시보드(`web/app.py`)에서는 단순 종목 코드 태그만 보일 뿐, 저장된 최근 종가·PER·목표주가·거래량이나 **PER 밸류에이션 밴드 신호 활성화에 필요한 스냅샷 누적 건수(`PER_BAND_MIN_SAMPLES = 20`)**를 확인할 방법이 없습니다.
-  3. 외부 유료 API나 추가 환경변수 없이 기존 `history.py`, `web/app.py`, `web/templates/index.html`만으로 완결성 있게 구현 및 검증할 수 있는 가장 우선순위 높은 기능입니다.
+- **선정 기능**: **축 A(위치)·축 C(펀더멘털) 핵심 지표의 신호/리포트/LLM 페이로드 연결 및 미사용 시황 수집기 파이프라인 정리**
+- **현재 상태 및 문제점**:
+  1. `collectors/watchlist_stocks.py`(축 A)와 `collectors/fundamentals.py`(축 C)에서 52주 밴드 백분위(`week52_pct`), 200일선 이격도(`pct_vs_ma200`), 52주 고점 대비 낙폭(`drawdown_from_high_pct`), 3·6·12개월 수익률, 벤치마크 대비 6개월 상대강도(`relative_strength_6m_pct`), PER(`trailing_pe`), PBR(`price_to_book`), 목표주가(`target_mean_price`) 등을 이미 수집하고 있습니다.
+  2. 그러나 `main.py`의 `_attach_related_news()`는 LLM(`interpret_signals`)에 `{"symbol", "severity", "type", "message", "related_news"}`만 전달하고 **수집된 위치·펀더멘털 데이터를 전부 누락**하고 있으며, `report.py`의 신호등 헤더에서도 해당 종목의 위치·밸류에이션 요약이 전혀 표시되지 않습니다.
+  3. 또한 `main.collect_all()`이 이메일 리포트(`build_email`)에서 전혀 쓰이지 않는 `us_market`, `kr_market`, `news` 수집기를 매번 호출하여 불필요한 네트워크 대기와 에러 노이즈를 발생시키고 있습니다.
 
 ---
 
 ## 2. 구현 범위 (Scope)
 
-### 2.1 포함 범위 (In-Scope)
-1. **히스토리 요약 및 최근 내역 조회 함수 추가 (`history.py`)**
-   - `get_recent_snapshots(symbol: str, limit: int = 30) -> list[dict]`:
-     - 특정 종목의 최근 `limit`개 일별 스냅샷을 날짜 내림차순(최신순)으로 반환한다.
-   - `get_watchlist_summary(symbols: list[str]) -> list[dict]`:
-     - 관심종목 리스트를 받아 각 종목의 **최신 스냅샷 데이터**(`latest_date`, `last_close`, `trailing_pe`, `target_mean_price`, `volume`), **직전 스냅샷 대비 종가 변동률**(`change_pct`), **총 누적 스냅샷 수**(`snapshot_count`), **PER 유효 샘플 수**(`pe_sample_count`)를 계산해 리스트로 반환한다.
-     - 스냅샷이 아직 1건도 없는 신규 종목도 누락하지 않고 기본값(`latest_date: None`, `snapshot_count: 0`, `pe_sample_count: 0` 등)으로 포함하여 반환한다.
-2. **웹 대시보드 히스토리 연동 및 종목 상세 히스토리 API/뷰 추가 (`web/app.py`)**
-   - `GET /` (메인 대시보드):
-     - 기존 관심종목(`us_stocks`, `kr_stocks`) 및 수신자 목록 외에 `history.get_watchlist_summary(all_symbols)` 결과를 템플릿 컨텍스트(`stock_summaries`)로 전달한다.
-   - `GET /history/{symbol}` (종목별 스냅샷 히스토리 JSON 조회 엔드포인트):
-     - 특정 종목(`symbol`)의 최근 스냅샷 내역(`get_recent_snapshots(symbol, limit=30)`)과 요약 정보를 JSON(`{"symbol": symbol, "count": ..., "snapshots": [...]}`)으로 반환한다.
-     - 대시보드 UI에서 종목 클릭 시 모달 또는 상세 테이블로 최근 시계열 데이터를 확인하거나 API로 검증할 수 있게 한다.
-3. **대시보드 UI에 스냅샷 요약 테이블 및 히스토리 확인 섹션 추가 (`web/templates/index.html`)**
-   - 하단에 **"📈 관심종목 스냅샷 히스토리 요약"** 섹션을 추가하여 종목별로 다음 항목을 표시한다:
-     - 종목 심볼 (`symbol`)
-     - 최근 수집일 (`latest_date` / 데이터 없으면 `"미수집"`)
-     - 최근 종가 (`last_close`) 및 직전 스냅샷 대비 등락률 (`change_pct`)
-     - Trailing PER (`trailing_pe`) 및 애널리스트 평균 목표주가 (`target_mean_price`)
-     - 최근 거래량 (`volume`)
-     - PER 밴드 신호 준비 상태 (`pe_sample_count / 20` — 20건 이상이면 `"활성"`, 미만이면 `"수집 중 (N/20)"` 배지 표시)
+### 2.1 `main.py` 수정 범위
+1. **`collect_all(all_symbols: list) -> dict` 미사용 수집기 호출 제거**
+   - `collect_all`에서 실제 브리핑(`build_email`)에 쓰이지 않는 `us_market.fetch`, `kr_market.fetch`, `news.fetch` 호출을 제거한다.
+   - `economic_cal.fetch`는 항상 실행하고, `all_symbols`가 비어 있지 않을 때 `watchlist_stocks.fetch(all_symbols)`(`"watchlist"`)와 `fundamentals.fetch(all_symbols)`(`"fundamentals"`)를 실행한다.
+   - `economic_cal` 결과(`dict`) 내부의 `"errors"` 리스트는 기존과 동일하게 `results["_errors"]`에 병합한다.
+   - *(주의: `collectors/us_market.py`, `collectors/kr_market.py`, `collectors/news.py` 파일 자체와 해당 단위 테스트 파일은 삭제하지 않는다.)*
+2. **신호 객체에 축 A(위치)·축 C(펀더멘털) 컨텍스트 첨부 (`_attach_related_news`)**
+   - 시그니처:
+     ```python
+     def _attach_related_news(
+         detected_signals: list,
+         watchlist: dict,
+         fundamentals_data: dict | None = None,
+     ) -> list:
+     ```
+     *(기존 2개 인자 호출 `_attach_related_news(detected_signals, watchlist)`과도 하위 호환되도록 `fundamentals_data: dict | None = None` 기본값을 둔다.)*
+   - 추출할 키 상수 정의:
+     ```python
+     POSITION_CONTEXT_KEYS = (
+         "last_close",
+         "week52_pct",
+         "pct_vs_ma200",
+         "drawdown_from_high_pct",
+         "return_3m_pct",
+         "return_6m_pct",
+         "return_12m_pct",
+         "relative_strength_6m_pct",
+         "volume_ratio",
+     )
+     FUNDAMENTAL_CONTEXT_KEYS = (
+         "trailing_pe",
+         "forward_pe",
+         "price_to_book",
+         "target_mean_price",
+         "recommendation",
+         "next_earnings_date",
+     )
+     ```
+   - 각 신호 `sig`에 대해:
+     - `pos = (watchlist or {}).get(sig["symbol"]) or {}` (단, `"error" in pos`이면 빈 딕셔너리 `{}`로 취급)
+     - `fund = (fundamentals_data or {}).get(sig["symbol"]) or {}` (단, `"error" in fund`이면 빈 딕셔너리 `{}`로 취급)
+     - 반환되는 각 신호 dict에 다음 3개 필드를 포함시킨다:
+       - `"related_news": (pos.get("news") or [])[:3]`
+       - `"position": {k: pos.get(k) for k in POSITION_CONTEXT_KEYS if pos.get(k) is not None}`
+       - `"fundamentals": {k: fund.get(k) for k in FUNDAMENTAL_CONTEXT_KEYS if fund.get(k) is not None}`
+3. **`build_email(watchlist: dict, fundamentals_data: dict, econ_cal: dict) -> str` 연결**
+   - `enriched_signals = _attach_related_news(detected_signals, watchlist, fundamentals_data)`로 호출한다.
+   - `report.build_report(detected_signals, watchlist_symbols, today_str, calendar_events, detail_text, watchlist=watchlist, fundamentals=fundamentals_data)`로 `watchlist`와 `fundamentals_data`를 전달한다.
 
-### 2.2 제외 범위 (Out-of-Scope)
-- 데이터 수집기(`collectors/*`)나 신호 판정 규칙(`signals.py`), 이메일 발송(`delivery/*`) 로직 변경은 포함하지 않는다.
-- 외부 차트 라이브러리(무거운 프론트엔드 번들) 도입 없이 기존 TailwindCSS 테이블/배지 UI 및 경량 구성을 유지한다.
+### 2.2 `report.py` 수정 범위
+1. **종목별 위치·밸류에이션 한 줄 요약 포맷터 추가 (`format_position_summary`)**
+   - 시그니처:
+     ```python
+     def format_position_summary(pos: dict | None, fund: dict | None = None) -> str:
+     ```
+   - 동작 규칙:
+     - `pos`가 `None`이거나 `"error" in pos`이면 빈 딕셔너리 `{}`로 처리하고, `fund`가 `None`이거나 `"error" in fund`이면 빈 딕셔너리 `{}`로 처리한다.
+     - 아래 순서대로 값이 `None`이 아닌 항목만 리스트에 담아 `" · "`로 연결하여 반환한다 (모든 항목이 `None`이면 `""` 반환):
+       1. `pos.get("week52_pct") is not None` → `f"52주 밴드 {pos['week52_pct']:.1f}%"`
+       2. `pos.get("pct_vs_ma200") is not None` → `f"200일선 {pos['pct_vs_ma200']:+.1f}%"`
+       3. `pos.get("relative_strength_6m_pct") is not None` → `f"6M 상대강도 {pos['relative_strength_6m_pct']:+.1f}%p"`
+       4. `fund.get("trailing_pe") is not None` → `f"PER {fund['trailing_pe']:.1f}배"`
+     - 출력 예시: `"52주 밴드 88.0% · 200일선 +14.2% · 6M 상대강도 +9.1%p · PER 28.5배"`
+2. **`build_header` 및 `build_report`에서 위치·밸류에이션 요약 줄 출력**
+   - 시그니처 (기존 호출과 100% 하위 호환 유지):
+     ```python
+     def build_header(
+         signals: list[dict],
+         watchlist_symbols: list[str],
+         today: str,
+         watchlist: dict | None = None,
+         fundamentals: dict | None = None,
+     ) -> str:
+     ```
+     ```python
+     def build_report(
+         signals: list[dict],
+         watchlist_symbols: list[str],
+         today: str,
+         calendar_events: list[str],
+         detail_text: str = "",
+         watchlist: dict | None = None,
+         fundamentals: dict | None = None,
+     ) -> str:
+     ```
+   - `build_header`에서 `🔴 확인 필요` 및 `🟡 관찰`의 각 신호 줄(`  {s['symbol']:<8}{s['message']}`)을 출력한 직후, `watchlist` 또는 `fundamentals`에 해당 종목 데이터가 존재하여 `summary = format_position_summary((watchlist or {}).get(s["symbol"]), (fundamentals or {}).get(s["symbol"]))`가 빈 문자열이 아니면 바로 다음 줄에 아래 형식으로 추가한다:
+     ```
+         └ 52주 밴드 88.0% · 200일선 +14.2% · 6M 상대강도 +9.1%p · PER 28.5배
+     ```
+     *(앞 공백 4칸 + `└ ` + `summary`)*
+   - `watchlist`와 `fundamentals`가 모두 `None`(또는 빈 dict)으로 호출된 경우에는 기존 출력과 완전히 동일해야 한다.
+
+### 2.3 `summarizer/openrouter_client.py` 수정 범위
+- `SYSTEM_PROMPT`의 규칙 목록에 다음 지침을 반영한다:
+  - 전달된 신호 데이터의 `position`(52주 밴드 백분위, 200일선 이격도, 고점 대비 낙폭, 수익률, 6개월 상대강도 등) 및 `fundamentals`(PER, PBR, 목표주가 등)에 포함된 수치를 적극 인용하여 해당 신호의 중장기적 맥락을 설명하되, 데이터에 없는 숫자는 절대 계산하거나 지어내지 않는다.
 
 ---
 
@@ -62,67 +119,64 @@
 
 | 파일 경로 | 수정 구분 | 주요 변경 내용 |
 |---|---|---|
-| `history.py` | 기능 추가 | `get_recent_snapshots(symbol, limit=30)` 및 `get_watchlist_summary(symbols)` 함수 추가 |
-| `web/app.py` | 기능 수정/추가 | `GET /` 라우트에 `stock_summaries` 컨텍스트 추가, `GET /history/{symbol}` JSON 엔드포인트 추가 |
-| `web/templates/index.html` | UI 수정 | 관심종목별 최신 스냅샷 지표(종가, PER, 목표주가, 거래량, PER 밴드 샘플 진행률) 요약 테이블 렌더링 |
-| `tests/test_history.py` | 테스트 추가 | `get_recent_snapshots`, `get_watchlist_summary`의 정상/경계/예외 케이스 단위 테스트 추가 |
-| `tests/web/test_app.py` | 테스트 추가 | 대시보드 스냅샷 요약 렌더링 및 `/history/{symbol}` 엔드포인트 정상/예외 케이스 통합 테스트 추가 |
+| `main.py` | 수정 | `collect_all`에서 미사용 수집기(`us_market`, `kr_market`, `news`) 호출 제거, `_attach_related_news`에 `position`·`fundamentals` 컨텍스트 추가, `build_email`에서 `report.build_report`로 `watchlist`·`fundamentals_data` 전달 |
+| `report.py` | 수정 | `format_position_summary(pos, fund)` 추가, `build_header` 및 `build_report`에 선택 인자 `watchlist`, `fundamentals` 추가 및 `    └ {summary}` 라인 렌더링 |
+| `summarizer/openrouter_client.py` | 수정 | `SYSTEM_PROMPT`에 `position` 및 `fundamentals` 컨텍스트 인용 규칙 명시 |
+| `tests/test_main.py` | 수정/추가 | `collect_all` 테스트를 정리된 수집기 기준에 맞게 갱신하고, LLM 페이로드에 `position`·`fundamentals`가 포함되는지 및 에러 종목 방어 테스트 추가 |
+| `tests/test_report.py` | 추가 | `format_position_summary` 단위 테스트 및 `build_header`/`build_report`의 위치 요약 줄 포함·생략 테스트 추가 |
+| `docs/implementation-result.md` | 신규 생성 | 구현 완료 후 변경 파일, 구현 내용 요약, `pytest` 실행 결과를 정리하여 작성 |
 
 ---
 
 ## 4. 완료 조건 (Definition of Done)
 
-1. `history.get_recent_snapshots(symbol, limit)` 호출 시 해당 종목의 스냅샷이 최신 날짜순(`date DESC`)으로 최대 `limit`건 반환되어야 한다.
-2. `history.get_watchlist_summary(symbols)` 호출 시 전달된 `symbols` 순서를 유지하며 각 종목의 `symbol`, `latest_date`, `last_close`, `change_pct`, `trailing_pe`, `target_mean_price`, `volume`, `snapshot_count`, `pe_sample_count` 키를 포함한 딕셔너리 리스트를 반환해야 한다.
-3. 스냅샷이 2건 이상 존재하고 `last_close`가 유효한 경우, 최신 스냅샷과 직전 스냅샷 간 종가 등락률(`change_pct`, 소수점 둘째 자리 반올림)이 정확히 계산되어야 한다.
-4. `GET /` 요청 시 응답 HTML에 등록된 관심종목의 최신 스냅샷 요약 정보(종가, PER, 목표주가, 스냅샷 누적 상태 또는 데이터 없을 시 `"미수집"` 안내)가 정상 렌더링되어야 한다.
-5. `GET /history/{symbol}` 요청 시 HTTP 200과 함께 `{"symbol": ..., "count": ..., "snapshots": [...]}` 구조의 JSON을 반환해야 한다.
-6. 기존 58개 테스트 케이스와 신규 추가된 테스트 케이스가 `python -m pytest tests/ -q` 실행 시 모두 통과(Pass)해야 한다.
+1. `main.collect_all(all_symbols)` 호출 시 `us_market.fetch`, `kr_market.fetch`, `news.fetch`가 호출되지 않고, `economic_cal.fetch`와 (`all_symbols` 존재 시) `watchlist_stocks.fetch`, `fundamentals.fetch`만 실행되어야 한다.
+2. `main._attach_related_news(detected_signals, watchlist, fundamentals_data)` 호출 결과 각 신호 딕셔너리에 `"related_news"`, `"position"`, `"fundamentals"` 키가 포함되어야 하며, 값이 `None`인 세부 지표는 `"position"` / `"fundamentals"` 딕셔너리에서 제외되어야 한다.
+3. `report.format_position_summary(pos, fund)`가 `week52_pct`, `pct_vs_ma200`, `relative_strength_6m_pct`, `trailing_pe` 중 존재하는 값만 `" · "`로 연결한 문자열을 반환해야 한다.
+4. `report.build_header` 및 `report.build_report` 호출 시 `watchlist`·`fundamentals`가 주어지면 신호 줄 아래에 `    └ ...` 요약 줄이 출력되고, 주어지지 않으면(`None` 또는 유효 지표 없음) 기존과 동일하게 요약 줄 없이 출력되어야 한다.
+5. `python -m pytest tests/ -q` 실행 시 전체 테스트 스위트가 실패 없이 100% 통과해야 한다.
+6. 구현 결과 보고서가 `docs/implementation-result.md`에 작성되어야 한다.
 
 ---
 
 ## 5. 테스트할 정상 상황과 예외 상황
 
 ### 5.1 정상 상황 (Normal Cases)
-1. **다수 일자 스냅샷이 축적된 종목의 요약 조회 (`test_get_watchlist_summary_with_history`)**
-   - **Given**: `NVDA`에 대해 `2026-08-01`(종가 100.0, PER 30.0)과 `2026-08-02`(종가 105.0, PER 31.5, 목표주가 140.0, 거래량 50000) 스냅샷 2건이 저장되어 있음.
-   - **When**: `history.get_watchlist_summary(["NVDA"])` 호출.
-   - **Then**: `latest_date == "2026-08-02"`, `last_close == 105.0`, `change_pct == 5.0`, `trailing_pe == 31.5`, `target_mean_price == 140.0`, `snapshot_count == 2`, `pe_sample_count == 2`가 반환됨.
-2. **최근 스냅샷 `limit` 제한 및 정렬 확인 (`test_get_recent_snapshots_respects_limit_and_desc_order`)**
-   - **Given**: 특정 종목에 5일치 스냅샷(`2026-08-01` ~ `2026-08-05`)이 저장되어 있음.
-   - **When**: `history.get_recent_snapshots("NVDA", limit=3)` 호출.
-   - **Then**: 가장 최근 3일(`["2026-08-05", "2026-08-04", "2026-08-03"]`) 순서로 3건만 반환됨.
-3. **웹 대시보드 메인 화면에 스냅샷 요약 표시 (`test_dashboard_renders_snapshot_summary`)**
-   - **Given**: `watchlist.json`에 `NVDA`가 등록되어 있고, DB에 `NVDA` 스냅샷(종가 `123.45`, PER `35.2`)이 저장되어 있음.
-   - **When**: `GET /` 요청.
-   - **Then**: HTTP 200 응답 본문에 `123.45`, `35.2`, 수집 상태(`1/20`)가 포함되어 렌더링됨.
-4. **종목별 히스토리 API 조회 (`test_history_endpoint_returns_snapshots`)**
-   - **Given**: DB에 `AAPL` 스냅샷 2건이 저장되어 있음.
-   - **When**: `GET /history/aapl` (소문자 입력 포함) 요청.
-   - **Then**: 대문자로 정규화된 `"symbol": "AAPL"`, `"count": 2`, `"snapshots"` 배열(길이 2)이 JSON으로 반환됨.
+1. **신호 발생 시 LLM 페이로드에 `position` 및 `fundamentals` 컨텍스트 첨부 확인 (`test_build_email_attaches_position_and_fundamentals_to_llm_payload`)**
+   - **Given**: `NVDA`에 200일선 상향 돌파 신호가 발생하고, `watchlist["NVDA"]`에 `week52_pct=88.0`, `pct_vs_ma200=14.2`, `relative_strength_6m_pct=9.1`이 있으며, `fundamentals["NVDA"]`에 `trailing_pe=28.5`, `target_mean_price=150.0`이 있음.
+   - **When**: `main.build_email(watchlist, fundamentals, {})` 실행.
+   - **Then**: `interpret_signals`에 전달된 첫 번째 신호 객체의 `sig["position"]`에 `week52_pct == 88.0`, `pct_vs_ma200 == 14.2`, `relative_strength_6m_pct == 9.1`이 포함되고, `sig["fundamentals"]`에 `trailing_pe == 28.5`, `target_mean_price == 150.0`이 포함됨.
+2. **브리핑 리포트 헤더에 위치·밸류에이션 한 줄 요약 렌더링 확인 (`test_build_report_includes_position_summary_line`)**
+   - **Given**: `NVDA` 신호 1건과 `watchlist={"NVDA": {"week52_pct": 88.0, "pct_vs_ma200": 14.2, "relative_strength_6m_pct": -3.5}}`, `fundamentals={"NVDA": {"trailing_pe": 28.5}}`가 주어짐.
+   - **When**: `report.build_report(signals, ["NVDA"], "2026-08-02", [], detail_text="해설", watchlist=watchlist, fundamentals=fundamentals)` 호출.
+   - **Then**: 반환된 리포트 문자열에 `"    └ 52주 밴드 88.0% · 200일선 +14.2% · 6M 상대강도 -3.5%p · PER 28.5배"`가 포함됨.
+3. **`collect_all`이 필요한 수집기만 실행하는지 확인 (`test_collect_all_runs_only_active_collectors`)**
+   - **Given**: `all_symbols = ["NVDA"]`.
+   - **When**: `main.collect_all(["NVDA"])` 호출.
+   - **Then**: `watchlist`, `fundamentals`, `economic_cal` 결과만 수집되고 `us_market`, `kr_market`, `news` 키는 결과에 존재하지 않음.
+4. **`format_position_summary`의 전체 지표 포맷팅 확인 (`test_format_position_summary_all_fields`)**
+   - **Given**: `pos = {"week52_pct": 22.5, "pct_vs_ma200": -12.34, "relative_strength_6m_pct": 4.56}`, `fund = {"trailing_pe": 19.84}`.
+   - **When**: `report.format_position_summary(pos, fund)` 호출.
+   - **Then**: `"52주 밴드 22.5% · 200일선 -12.3% · 6M 상대강도 +4.6%p · PER 19.8배"` 반환.
 
 ### 5.2 예외 및 경계 상황 (Exception & Edge Cases)
-1. **스냅샷이 전혀 없는 신규 등록 종목 (`test_get_watchlist_summary_for_symbol_without_snapshots`)**
-   - **Given**: 관심종목에 `MSFT`를 방금 추가하여 `daily_snapshot` 테이블에 레코드가 0건임.
-   - **When**: `history.get_watchlist_summary(["MSFT"])` 및 `GET /` 호출.
-   - **Then**: 에러 없이 `latest_date: None`, `last_close: None`, `change_pct: None`, `snapshot_count: 0`, `pe_sample_count: 0`을 반환하고, 대시보드 HTML에는 `"미수집"`(또는 `-`)으로 안전하게 표시됨.
-2. **스냅샷이 1건뿐이거나 직전 종가가 `None`/`0`인 경우 (`test_get_watchlist_summary_single_snapshot_or_null_close`)**
-   - **Given**: 스냅샷이 1건만 존재하거나, 직전 스냅샷의 `last_close`가 `None` 또는 `0`임 (`ZeroDivisionError` 위험).
-   - **When**: `history.get_watchlist_summary(["NVDA"])` 호출.
-   - **Then**: `ZeroDivisionError`나 `TypeError`가 발생하지 않고 `change_pct`가 `None`으로 반환됨.
-3. **일부 컬럼(`trailing_pe`, `target_mean_price`)이 `None`인 스냅샷 (ETF 또는 적자 기업) (`test_pe_sample_count_excludes_null_pe`)**
-   - **Given**: 5건의 스냅샷 중 3건만 `trailing_pe`가 숫자로 존재하고 2건은 `None`임.
-   - **When**: `history.get_watchlist_summary(["069500.KS"])` 호출.
-   - **Then**: `snapshot_count == 5`이고, `pe_sample_count == 3`으로 정확히 집계됨.
-4. **빈 관심종목 리스트 전달 (`test_get_watchlist_summary_empty_list`)**
-   - **Given**: 미국/한국 관심종목이 모두 비어 있음(`symbols = []`).
-   - **When**: `history.get_watchlist_summary([])` 호출.
-   - **Then**: DB 오류 없이 빈 리스트 `[]`를 반환함.
-5. **존재하지 않는 종목에 대한 `/history/{symbol}` 호출 (`test_history_endpoint_unknown_symbol`)**
-   - **Given**: DB에 기록이 없는 `UNKNOWN` 종목 조회.
-   - **When**: `GET /history/UNKNOWN` 요청.
-   - **Then**: 500 에러가 아닌 HTTP 200과 `{"symbol": "UNKNOWN", "count": 0, "snapshots": []}`를 반환함.
-6. **잘못된 `limit` 파라미터 방어 (`test_get_recent_snapshots_invalid_limit`)**
-   - **Given**: `limit <= 0`으로 `get_recent_snapshots("NVDA", limit=0)` 호출.
-   - **When**: 함수 실행.
-   - **Then**: 빈 리스트 `[]`를 반환하며 예외가 발생하지 않음.
+1. **일부 지표가 `None`인 경우(상장 200일 미만 종목 또는 적자 기업으로 PER `None`) (`test_format_position_summary_omits_none_fields`)**
+   - **Given**: `pos = {"week52_pct": 50.0, "pct_vs_ma200": None, "relative_strength_6m_pct": None}`, `fund = {"trailing_pe": None}`.
+   - **When**: `report.format_position_summary(pos, fund)` 호출.
+   - **Then**: `None`인 항목은 건너뛰고 `"52주 밴드 50.0%"`만 반환하며 `TypeError`가 발생하지 않음.
+2. **위치·펀더멘털 데이터가 모두 비어 있거나 `"error"`가 있는 경우 (`test_format_position_summary_returns_empty_on_error_or_empty`)**
+   - **Given**: `pos = {"error": "timeout"}` 또는 `pos = {}`, `fund = {"error": "404"}`.
+   - **When**: `report.format_position_summary(pos, fund)` 및 `report.build_header(signals, ["NVDA"], "2026-08-02", watchlist={"NVDA": pos}, fundamentals={"NVDA": fund})` 호출.
+   - **Then**: `format_position_summary`는 `""`를 반환하고, `build_header` 출력에 빈 `"└"` 줄이 찍히지 않음.
+3. **펀더멘털 수집에 실패(`{"error": "boom"}`)한 종목에서 위치 신호가 발생한 경우 (`test_attach_related_news_handles_errored_fundamentals`)**
+   - **Given**: `watchlist["NVDA"]`는 정상이어서 `ma200_cross` 신호가 발생했으나, `fundamentals["NVDA"] = {"error": "boom"}`인 상태.
+   - **When**: `main._attach_related_news(signals, watchlist, fundamentals)` 호출.
+   - **Then**: 예외 없이 `sig["position"]`은 정상 채워지고, `sig["fundamentals"]`는 빈 딕셔너리 `{}`가 됨.
+4. **`collect_all`에서 `economic_cal` 내부 에러 및 수집기 예외 처리 (`test_collect_all_merges_economic_cal_errors_and_handles_exception`)**
+   - **Given**: `economic_cal.fetch`가 `{"events": [], "errors": ["FRED: 400"]}`를 반환하거나, `watchlist_stocks.fetch`에서 예외가 발생함.
+   - **When**: `main.collect_all(["NVDA"])` 호출.
+   - **Then**: `result["_errors"]`에 `"FRED: 400"` 및 `"watchlist: ..."` 에러 메시지가 정상 기록되고 프로세스가 중단되지 않음.
+5. **관심종목이 비어 있을 때(`all_symbols = []`) `collect_all` 동작 (`test_collect_all_with_empty_symbols`)**
+   - **Given**: `all_symbols = []`.
+   - **When**: `main.collect_all([])` 호출.
+   - **Then**: `watchlist_stocks.fetch`와 `fundamentals.fetch`는 호출되지 않고 `economic_cal.fetch`만 실행됨.
