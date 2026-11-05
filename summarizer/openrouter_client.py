@@ -19,14 +19,9 @@ client = OpenAI(
     api_key=OPENROUTER_API_KEY or "unset",
 )
 
-# Verified against https://openrouter.ai/api/v1/models at write time — OpenRouter's
-# free tier rotates often (the previous list's llama-3.3-70b:free had already been
-# pulled), so if summarize starts failing, re-check that list before assuming a bug.
-MODELS = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "google/gemma-4-31b-it:free",
-    "openai/gpt-oss-20b:free",
-]
+# Route to currently available free models instead of retired fixed model IDs.
+# https://openrouter.ai/docs/guides/routing/routers/free-router
+MODELS = ["openrouter/free"]
 
 BASE_MAX_TOKENS = 400
 PER_SIGNAL_TOKENS = 300

@@ -221,7 +221,11 @@ def build_email(watchlist: dict, fundamentals_data: dict, econ_cal: dict, news_d
     detail_text = ""
     if detected_signals:
         enriched_signals = _attach_related_news(detected_signals, related_news_by_symbol)
-        detail_text = interpret_signals(enriched_signals)
+        try:
+            detail_text = interpret_signals(enriched_signals)
+        except Exception:
+            log.warning("AI interpretation failed; sending deterministic report", exc_info=True)
+            detail_text = "AI 해설을 일시적으로 제공하지 못했습니다. 리포트의 신호와 수치는 규칙 엔진이 생성한 결과입니다."
 
     return report.build_report(
         detected_signals, watchlist, names, today_str, calendar_events,

@@ -450,3 +450,48 @@ def test_main_sends_when_quiet_but_policy_is_one_line(monkeypatch):
     main.main()
 
     mock_send.assert_called_once()
+
+
+def test_build_email_preserves_briefing_when_llm_unavailable(caplog):
+    import main
+
+    with patch("main.interpret_signals", side_effect=RuntimeError("모든 모델 실패: 404")):
+        body = main.build_email(
+            {"NVDA": _pos(ma200_cross="golden")}, {},
+            {"events": [{"name": "주요 거시 일정"}]}, {},
+        )
+    assert "200일선 상향 돌파" in body
+    assert "주요 거시 일정" in body
+    assert "AI 해설을 일시적으로 제공하지 못했습니다." in body
+    assert "투자 참고용" in body
+    assert "404" not in body
+    assert "모든 모델 실패: 404" in caplog.text
+
+
+def test_main_sends_report_and_persists_outputs_when_llm_unavailable(monkeypatch):
+    import main
+
+    monkeypatch.setattr("config.validate", lambda: None)
+    monkeypatch.setattr(main.store, "load_watchlist", lambda: {})
+    monkeypatch.setattr(main.store, "watchlist_symbols", lambda wl: ["NVDA"])
+    monkeypatch.setattr(main.store, "resolve_all_symbols", lambda wl: {"NVDA": {}})
+    monkeypatch.setattr(main.store, "load_report_config", lambda: {
+        "email": {"blocks": ["positions"], "recipients": ["a@test.com"]},
+    })
+    monkeypatch.setattr(main, "collect_all", lambda symbols: {
+        "watchlist": {"NVDA": _pos(ma200_cross="golden")},
+        "fundamentals": {}, "news": {}, "economic_cal": {}, "_errors": [],
+    })
+    with patch("main.interpret_signals", side_effect=RuntimeError("모든 모델 실패: 404")), \
+         patch("main.discovery_engine.build_discovery", return_value=[]), \
+         patch("main.publish.save_latest") as save_latest, \
+         patch("main.send") as send, patch("main.send_error") as send_error:
+        main.main()
+    send.assert_called_once()
+    assert send.call_args.kwargs == {"to": "a@test.com"}
+    assert "200일선 상향 돌파" in send.call_args.args[0]
+    assert "AI 해설을 일시적으로 제공하지 못했습니다." in send.call_args.args[0]
+    send_error.assert_not_called()
+    save_latest.assert_called_once()
+    import history
+    assert history.get_snapshot("NVDA", main.date.today().isoformat()) is not None
